@@ -3,6 +3,8 @@
   const STORAGE_KEY = 'sorenity_pomodoro_state';
   const FOCUS_SECONDS = 25 * 60;
   const BREAK_SECONDS = 5 * 60;
+  const STAR_REWARD_SECONDS = 60 * 60;
+  const STAR_REWARD_POINTS = 10;
   const CIRCUMFERENCE = 2 * Math.PI * 96;
   const quotes = [
     'You don’t have to do it all at once. Just begin.',
@@ -14,6 +16,17 @@
     'Stay curious. You are growing every time you try.'
   ];
 
+  function localDateKey(timestamp = Date.now()) {
+    const date = new Date(timestamp);
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  }
+
+  function localDayStart(timestamp = Date.now()) {
+    const date = new Date(timestamp);
+    date.setHours(0, 0, 0, 0);
+    return date.getTime();
+  }
+
   function initStudyZone() {
     const pane = document.getElementById('tab-pane-study');
     const clock = document.getElementById('pomodoro-time');
@@ -23,6 +36,8 @@
     const resetButton = document.getElementById('pomodoro-reset');
     const progress = document.getElementById('pomodoro-progress');
     const totalLabel = document.getElementById('study-total-time');
+    const starCount = document.getElementById('star-points-count');
+    const starChip = document.getElementById('star-points-chip');
     const quote = document.getElementById('milo-quote');
     const caption = document.getElementById('milo-caption');
     if (!pane || !clock || !startButton || !resetButton || !progress || !totalLabel) return;
@@ -31,22 +46,58 @@
     try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') || {}; } catch (_) {}
 
     let phase = saved.phase === 'break' ? 'break' : 'focus';
+    const today = localDateKey();
+    let studyDate = saved.studyDate || '';
+    const dayChangedAtLoad = studyDate !== today;
     let totalFocusSeconds = Math.max(0, Number(saved.totalFocusSeconds) || 0);
+    if (dayChangedAtLoad) totalFocusSeconds = 0;
+    studyDate = today;
+    let lifetimeFocusSeconds = Math.max(0, Number(saved.lifetimeFocusSeconds) || 0);
+    let rewardedHours = Number.isFinite(Number(saved.rewardedHours))
+      ? Math.max(0, Number(saved.rewardedHours))
+      : Math.floor(lifetimeFocusSeconds / STAR_REWARD_SECONDS);
+    let starPoints = Number.isFinite(Number(saved.starPoints))
+      ? Math.max(0, Number(saved.starPoints))
+      : rewardedHours * STAR_REWARD_POINTS;
     const expiredWhileAway = Boolean(saved.running && Number(saved.endsAt) <= Date.now());
     let running = Boolean(saved.running && !expiredWhileAway);
     let endsAt = running ? Number(saved.endsAt) : null;
     let remaining = running
       ? Math.max(0, Math.ceil((endsAt - Date.now()) / 1000))
       : Math.max(1, Math.min(Number(saved.remaining) || (phase === 'break' ? BREAK_SECONDS : FOCUS_SECONDS), phase === 'break' ? BREAK_SECONDS : FOCUS_SECONDS));
-    let focusSegmentSeconds = phase === 'focus'
-      ? Math.max(1, Math.min(FOCUS_SECONDS, Number(saved.focusSegmentSeconds) || (running ? Number(saved.remaining) || FOCUS_SECONDS : 0)))
+    const hasSavedFocusSegment = Number.isFinite(Number(saved.focusSegmentSeconds));
+    let focusSegmentSeconds = phase === 'focus' && saved.running
+      ? Math.max(0, Math.min(FOCUS_SECONDS, hasSavedFocusSegment ? Number(saved.focusSegmentSeconds) : (Number(saved.remaining) || FOCUS_SECONDS)))
       : 0;
-    let focusSegmentStartedAt = phase === 'focus' && running
-      ? (Number(saved.focusSegmentStartedAt) || (endsAt - focusSegmentSeconds * 1000))
+    let focusSegmentStartedAt = phase === 'focus' && saved.running
+      ? (Number(saved.focusSegmentStartedAt) || (Number(saved.endsAt) - focusSegmentSeconds * 1000))
       : null;
 
+    if (dayChangedAtLoad && running && phase === 'focus' && focusSegmentStartedAt && !expiredWhileAway) {
+      const elapsedBeforeMidnight = Math.max(0, Math.min(focusSegmentSeconds,
+        Math.floor((localDayStart() - focusSegmentStartedAt) / 1000)));
+      lifetimeFocusSeconds += elapsedBeforeMidnight;
+      awardCompletedHours();
+      focusSegmentSeconds = Math.max(0, focusSegmentSeconds - elapsedBeforeMidnight);
+      focusSegmentStartedAt = Math.max(localDayStart(), focusSegmentStartedAt);
+    }
+
+    function awardCompletedHours() {
+      const completedHours = Math.floor(lifetimeFocusSeconds / STAR_REWARD_SECONDS);
+      if (completedHours > rewardedHours) {
+        starPoints += (completedHours - rewardedHours) * STAR_REWARD_POINTS;
+        rewardedHours = completedHours;
+        window.dispatchEvent(new CustomEvent('sorenity-star-points-changed', { detail: { balance: starPoints } }));
+      }
+    }
+
     if (expiredWhileAway && phase === 'focus') {
-      totalFocusSeconds += focusSegmentSeconds;
+      const segmentStart = focusSegmentStartedAt || (endsAt - focusSegmentSeconds * 1000);
+      const elapsedToday = Math.max(0, Math.min(focusSegmentSeconds,
+        Math.floor((Math.min(Number(saved.endsAt), Date.now()) - Math.max(segmentStart, localDayStart())) / 1000)));
+      totalFocusSeconds += elapsedToday;
+      lifetimeFocusSeconds += focusSegmentSeconds;
+      awardCompletedHours();
       phase = 'break';
       remaining = BREAK_SECONDS;
       running = true;
@@ -66,9 +117,29 @@
 
     function save() {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
-        phase, running, endsAt, remaining, totalFocusSeconds,
+        phase, running, endsAt, remaining, studyDate, totalFocusSeconds,
+        lifetimeFocusSeconds, rewardedHours, starPoints,
         focusSegmentStartedAt, focusSegmentSeconds
       }));
+    }
+
+    function ensureStudyDay(now = Date.now()) {
+      const today = localDateKey(now);
+      if (studyDate === today) return false;
+
+      const midnight = localDayStart(now);
+      if (phase === 'focus' && running && focusSegmentStartedAt) {
+        const elapsedBeforeMidnight = Math.max(0, Math.min(focusSegmentSeconds,
+          Math.floor((midnight - focusSegmentStartedAt) / 1000)));
+        lifetimeFocusSeconds += elapsedBeforeMidnight;
+        awardCompletedHours();
+        focusSegmentSeconds = Math.max(0, focusSegmentSeconds - elapsedBeforeMidnight);
+        focusSegmentStartedAt = Math.max(midnight, focusSegmentStartedAt);
+      }
+      studyDate = today;
+      totalFocusSeconds = 0;
+      save();
+      return true;
     }
 
     function showToast(message) {
@@ -97,6 +168,8 @@
       if (phase === 'focus' && running && focusSegmentStartedAt) {
         const elapsed = Math.min(focusSegmentSeconds, Math.max(0, Math.floor((now - focusSegmentStartedAt) / 1000)));
         totalFocusSeconds += elapsed;
+        lifetimeFocusSeconds += elapsed;
+        awardCompletedHours();
       }
       focusSegmentStartedAt = null;
       focusSegmentSeconds = 0;
@@ -117,12 +190,28 @@
           ? (remaining < FOCUS_SECONDS ? 'You’ve already made a start. Take a breath, then resume—one focused minute at a time.' : 'Ready when you are. Start a 25-minute focus session.')
           : 'Break time is ready whenever you are.');
       totalLabel.textContent = formatStudyDuration(currentFocusSeconds());
+      if (starCount) starCount.textContent = String(starPoints);
+      if (starChip) starChip.setAttribute('aria-label', `${starPoints} Star Points`);
       caption.textContent = phase === 'focus'
         ? (running ? 'I’m cheering you on. One thing at a time.' : 'I’ll be right here when you’re ready.')
         : (running ? 'Stretch, sip some water, and let your thoughts wander.' : 'Your break is complete. Start again when you feel ready.');
     }
 
+    window.sorenityStarWallet = {
+      getBalance: () => starPoints,
+      spend(amount) {
+        const cost = Math.floor(Number(amount));
+        if (!Number.isFinite(cost) || cost <= 0 || starPoints < cost) return false;
+        starPoints -= cost;
+        save();
+        render();
+        window.dispatchEvent(new CustomEvent('sorenity-star-points-changed', { detail: { balance: starPoints } }));
+        return true;
+      }
+    };
+
     function begin() {
+      ensureStudyDay();
       running = true;
       endsAt = Date.now() + remaining * 1000;
       if (phase === 'focus') {
@@ -153,6 +242,7 @@
     }
 
     startButton.addEventListener('click', function () {
+      ensureStudyDay();
       if (running) {
         remaining = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
         commitFocusSegment();
@@ -166,6 +256,7 @@
     });
 
     resetButton.addEventListener('click', function () {
+      ensureStudyDay();
       commitFocusSegment();
       phase = 'focus';
       remaining = FOCUS_SECONDS;
@@ -179,7 +270,11 @@
     if (expiredWhileAway) save();
     render();
     setInterval(function () {
-      if (!running) return;
+      const dayChanged = ensureStudyDay();
+      if (!running) {
+        if (dayChanged) render();
+        return;
+      }
       remaining = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
       if (remaining <= 0) completePhase();
       else render();
